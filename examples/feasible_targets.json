@@ -1,0 +1,11 @@
+{
+  "targets": [
+    {"dimension": "region",    "code": "East",  "population": 4},
+    {"dimension": "region",    "code": "South", "population": 2},
+    {"dimension": "region",    "code": "West",  "population": 3},
+    {"dimension": "region",    "code": "North", "population": 1},
+    {"dimension": "age_group", "code": "youth",  "population": 4},
+    {"dimension": "age_group", "code": "mid",    "population": 4},
+    {"dimension": "age_group", "code": "senior", "population": 2}
+  ]
+}

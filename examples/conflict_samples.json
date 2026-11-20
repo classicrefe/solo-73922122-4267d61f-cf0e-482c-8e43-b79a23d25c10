@@ -1,0 +1,7 @@
+{
+  "samples": [
+    {"person_id": "X", "region": "R1", "age_group": "a1", "d": 1},
+    {"person_id": "Y", "region": "R1", "age_group": "a2", "d": 1},
+    {"person_id": "Z", "region": "R2", "age_group": "a1", "d": 1}
+  ]
+}

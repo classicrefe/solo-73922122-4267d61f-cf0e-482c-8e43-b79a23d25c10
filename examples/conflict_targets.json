@@ -1,0 +1,6 @@
+{
+  "targets": [
+    {"dimension": "region",    "code": "R1", "population": 4},
+    {"dimension": "age_group", "code": "a1", "population": 1}
+  ]
+}

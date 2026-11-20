@@ -1,0 +1,12 @@
+{
+  "samples": [
+    {"person_id": "P1", "region": "East",  "age_group": "youth",  "d": 1},
+    {"person_id": "P2", "region": "East",  "age_group": "mid",    "d": 1},
+    {"person_id": "P3", "region": "East",  "age_group": "senior", "d": 2},
+    {"person_id": "P4", "region": "South", "age_group": "youth",  "d": 1},
+    {"person_id": "P5", "region": "South", "age_group": "mid",    "d": 3},
+    {"person_id": "P6", "region": "West",  "age_group": "youth",  "d": 1},
+    {"person_id": "P7", "region": "West",  "age_group": "senior", "d": 2},
+    {"person_id": "P8", "region": "North", "age_group": "mid",    "d": 1}
+  ]
+}
