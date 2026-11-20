@@ -7,6 +7,9 @@
 依次演示：
   1. 可行场景（目标行含线性冗余：四个地区之和 = 三个年龄段之和），
      轮询到成功，校验 0.5d<=w<=2d 与合计误差 <=1e-6；
+  1b. 录入对账：用场景 1 的成功作业，比对两份有分歧的是/否清单与
+     按地区/年龄段复核的加权赞成合计，展示可确认/需回访分歧，
+     以及复核汇总被人为抬高后的不相容应答；
   2. 冲突场景，返回最小冲突目标子集（删去任一项即可行）；
   3. 输入修改后旧作业 404、/result 返回 409，证明旧结果永久失效。
 """
@@ -18,10 +21,24 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 HERE = Path(__file__).resolve().parent
+
+
+def _round6(w: float) -> Decimal:
+    """与对账一致的舍入：权重四舍五入到 6 位小数。"""
+    return Decimal(str(w)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def _group_total(samples, weights_by_id, answers, dim, code) -> float:
+    """组内赞成权重（已舍入 6 位）加总后四舍五入到 2 位小数。"""
+    s = sum((_round6(weights_by_id[x["person_id"]])
+             for x in samples if x[dim] == code and answers[x["person_id"]]),
+            Decimal(0))
+    return float(s.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def call(method: str, path: str, payload=None):
@@ -80,6 +97,53 @@ def main() -> None:
     status, result = call("GET", "/result")
     print("GET /result ->", status, "(仅提供与当前输入一致的完整结果)")
     assert status == 200
+
+    print()
+    print("=" * 70)
+    print("场景 1b：录入对账（POST /reconcile）")
+    print("=" * 70)
+    job_id = ack["job_id"]
+    weights_by_id = {w["person_id"]: w["w"] for w in job["weights"]}
+    sample_rows = samples["samples"]
+    true_answers = {s["person_id"]: (i % 2 == 0)
+                    for i, s in enumerate(sample_rows)}
+    flips = ("P2", "P5", "P7")  # 清单 B 与清单 A 的 3 处分歧
+    list_a = [{"person_id": p, "answer": v} for p, v in true_answers.items()]
+    list_b = [{"person_id": p, "answer": (not v if p in flips else v)}
+              for p, v in true_answers.items()]
+    reviews = []
+    for dim in ("region", "age_group"):
+        for code in sorted({s[dim] for s in sample_rows}):
+            reviews.append({
+                "dimension": dim, "code": code,
+                "approve_total": _group_total(sample_rows, weights_by_id,
+                                              true_answers, dim, code)})
+    status, rec = call("POST", "/reconcile", {
+        "job_id": job_id, "list_a": list_a, "list_b": list_b,
+        "reviews": reviews})
+    print("POST /reconcile ->", status, "| 状态:", rec["status"])
+    assert status == 200 and rec["status"] == "ok"
+    print(f"分歧 {rec['discrepancy_count']} 处：可确认 "
+          f"{len(rec['confirmed'])} 处，需回访 {len(rec['needs_callback'])} 处")
+    for item in rec["confirmed"]:
+        print(f"  确认 {item['person_id']} -> {item['answer']}")
+        assert item["answer"] == true_answers[item["person_id"]]
+    for pid in rec["needs_callback"]:
+        print(f"  回访 {pid}")
+    handled = ({x["person_id"] for x in rec["confirmed"]}
+               | set(rec["needs_callback"]))
+    assert handled == set(flips)
+
+    bad_reviews = [dict(r) for r in reviews]
+    bad_reviews[0]["approve_total"] = round(
+        bad_reviews[0]["approve_total"] + 50, 2)
+    status, rec = call("POST", "/reconcile", {
+        "job_id": job_id, "list_a": list_a, "list_b": list_b,
+        "reviews": bad_reviews})
+    print("复核合计抬高 50 后 ->", rec["status"])
+    print("  原因:", rec["reason"])
+    assert rec["status"] == "incompatible"
+    assert rec["confirmed"] == [] and rec["needs_callback"] == []
 
     print()
     print("=" * 70)

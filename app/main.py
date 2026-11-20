@@ -1,4 +1,4 @@
-"""FastAPI 应用：样本/目标更正、后台权重计算、结果取用。"""
+"""FastAPI 应用：样本/目标更正、后台权重计算、结果取用、录入对账。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from . import reconcile as reconcile_mod
 from .db import Database
 from .jobs import JobManager
 from .schemas import (
+    ConfirmedAnswer,
     JobResult,
+    ReconcilePayload,
+    ReconcileResponse,
     SamplesPayload,
     TargetsPayload,
     TargetTotalsItem,
@@ -34,11 +38,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="回访问卷样本权重校正 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "根据地区/年龄段人口总量，对至多 200 人的基础权重 d 做二次规划校正，"
         "满足 0.5d ≤ w ≤ 2d 且目标人群权重合计等于人口总量，"
-        "最小化 Σ(w−d)²/d。任何样本/目标修改都会令旧结果与在途计算永久失效。"
+        "最小化 Σ(w−d)²/d。任何样本/目标修改都会令旧结果与在途计算永久失效。\n\n"
+        "对账：基于一次成功且仍有效的权重作业，比对两份逐人是/否录入清单与"
+        "按地区/年龄段复核的加权赞成合计，判定哪些分歧可直接确认、哪些仍需回访。"
     ),
     lifespan=lifespan,
 )
@@ -172,3 +178,111 @@ def get_result():
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health():
     return {"status": "ok", "epoch": db().get_epoch()}
+
+
+# ---------------------------------------------------------------- 对账
+def _reconcile_refused(payload: ReconcilePayload, reason: str) -> ReconcileResponse:
+    """作业失效时的统一应答：说明原因，不给任何确认项。"""
+    return ReconcileResponse(
+        job_id=payload.job_id,
+        epoch=db().get_epoch(),
+        status="job_invalid",
+        reason=reason,
+        review_count=len(payload.reviews),
+    )
+
+
+@app.post(
+    "/reconcile",
+    tags=["对账"],
+    summary="对账：用复核汇总判定两份录入清单的分歧是否仍需回访",
+    response_description="对账结论；非 ok 时说明原因且不给确认项",
+)
+def reconcile_lists(payload: ReconcilePayload) -> ReconcileResponse:
+    """接收成功且仍有效的权重作业号、两份逐人是/否清单和至多 12 项按
+    地区/年龄段复核的加权赞成人数。
+
+    规则：每人权重先四舍五入到 6 位小数，各组赞成权重加总后再四舍五入到
+    2 位小数；保留两份清单一致的答复，每处分歧从两份清单中取一个值，所有
+    复核合计须同时吻合。某处分歧在所有可行选法中取值都相同时，返回编号和
+    可确认答复（confirmed）；其余分歧列出编号供回访（needs_callback）。
+    汇总不相容（incompatible）、无法可靠判定（indeterminate）或作业失效
+    （job_invalid）时说明原因，不给确认项。
+
+    演示流程：先 PUT /samples 与 /targets，再 POST /calculate 并轮询
+    /jobs/{job_id} 至 succeeded，然后把该 job_id 填入本接口请求体试调。
+    """
+    row = db().get_job(payload.job_id)
+    if row is None:
+        return _reconcile_refused(
+            payload,
+            "作业不存在或已因输入变更而永久失效（任何样本/目标修改都会删除"
+            "历史作业），请重新 POST /calculate 后再对账",
+        )
+    if row["status"] != "succeeded":
+        return _reconcile_refused(
+            payload,
+            f"作业当前状态为 {row['status']}，只有成功（succeeded）且仍有效"
+            "的作业可用于对账",
+        )
+    if row["epoch"] != db().get_epoch():
+        # 理论上不会发生（epoch 变更即删除作业），双保险
+        return _reconcile_refused(
+            payload, "作业已不属于当前输入版本，结果已失效，请重新计算"
+        )
+
+    snap = json.loads(row["input_snapshot"])
+    samples = snap["samples"]
+    result = json.loads(row["result"])
+    w_by_id = {w["person_id"]: w["w"] for w in result["weights"]}
+    weights = [w_by_id[s["person_id"]] for s in samples]
+
+    # 两份清单必须各含快照中每人一条答复（不多不少、不重复——重复已由
+    # 请求模型拦截）
+    snapshot_ids = [s["person_id"] for s in samples]
+    id_set = set(snapshot_ids)
+    answers: dict[str, dict[str, bool]] = {}
+    for name, lst in (("list_a", payload.list_a), ("list_b", payload.list_b)):
+        got = [a.person_id for a in lst]
+        if len(got) != len(snapshot_ids) or set(got) != id_set:
+            raise HTTPException(
+                422,
+                f"{name} 必须恰好覆盖作业快照中的 {len(snapshot_ids)} 人："
+                "每人一条答复，且不含快照外人员",
+            )
+        answers[name] = {a.person_id: a.answer for a in lst}
+
+    disc_count = sum(
+        1 for pid in snapshot_ids
+        if answers["list_a"][pid] != answers["list_b"][pid]
+    )
+    if disc_count > reconcile_mod.MAX_DISCREPANCIES:
+        raise HTTPException(
+            422,
+            f"两份清单分歧 {disc_count} 处，超过上限 "
+            f"{reconcile_mod.MAX_DISCREPANCIES} 处",
+        )
+
+    reviews = [r.model_dump() for r in payload.reviews]
+    outcome = reconcile_mod.reconcile(
+        samples, weights, answers["list_a"], answers["list_b"], reviews
+    )
+
+    # 计算期间输入被修改的防御性复核：作业一旦失效，结论一并作废
+    if db().get_epoch() != row["epoch"] or db().get_job(payload.job_id) is None:
+        return _reconcile_refused(
+            payload, "对账期间输入发生变更，作业已失效，结论作废，请重新计算后再对账"
+        )
+
+    return ReconcileResponse(
+        job_id=payload.job_id,
+        epoch=row["epoch"],
+        status=outcome.status,
+        reason=outcome.reason,
+        review_count=len(payload.reviews),
+        discrepancy_count=outcome.discrepancy_count,
+        confirmed=[ConfirmedAnswer(person_id=p, answer=a)
+                   for p, a in outcome.confirmed],
+        needs_callback=outcome.needs_callback,
+        incompatible_reviews=outcome.incompatible_reviews,
+    )
